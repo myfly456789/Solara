@@ -1,6 +1,10 @@
 const DEFAULT_API_BASE_URL = "https://music-api.gdstudio.xyz/api.php";
-const KUWO_HOST_PATTERN = /(^|\.)kuwo\.cn$/i;
 const SAFE_RESPONSE_HEADERS = ["content-type", "cache-control", "accept-ranges", "content-length", "content-range", "etag", "last-modified", "expires"];
+// 各音频源的 Referer 映射，用于绕过上游防盗链
+const REFERER_MAP: Record<string, string> = {
+  "kuwo.cn": "https://www.kuwo.cn/",
+  "music.126.net": "https://music.126.com/",
+};
 
 function createCorsHeaders(init?: Headers): Headers {
   const headers = new Headers();
@@ -30,29 +34,30 @@ function handleOptions(): Response {
   });
 }
 
-function isAllowedKuwoHost(hostname: string): boolean {
-  if (!hostname) return false;
-  return KUWO_HOST_PATTERN.test(hostname);
+function resolveReferer(hostname: string): string | undefined {
+  const lower = hostname.toLowerCase();
+  for (const [host, referer] of Object.entries(REFERER_MAP)) {
+    if (lower === host || lower.endsWith("." + host)) {
+      return referer;
+    }
+  }
+  return undefined;
 }
 
-function normalizeKuwoUrl(rawUrl: string): URL | null {
+function normalizeAudioTarget(rawUrl: string): URL | null {
   try {
     const parsed = new URL(rawUrl);
-    if (!isAllowedKuwoHost(parsed.hostname)) {
-      return null;
-    }
     if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
       return null;
     }
-    parsed.protocol = "http:";
     return parsed;
   } catch {
     return null;
   }
 }
 
-async function proxyKuwoAudio(targetUrl: string, request: Request): Promise<Response> {
-  const normalized = normalizeKuwoUrl(targetUrl);
+async function proxyAudioTarget(targetUrl: string, request: Request): Promise<Response> {
+  const normalized = normalizeAudioTarget(targetUrl);
   if (!normalized) {
     return new Response("Invalid target", { status: 400 });
   }
@@ -61,9 +66,13 @@ async function proxyKuwoAudio(targetUrl: string, request: Request): Promise<Resp
     method: request.method,
     headers: {
       "User-Agent": request.headers.get("User-Agent") ?? "Mozilla/5.0",
-      "Referer": "https://www.kuwo.cn/",
     },
   };
+
+  const referer = resolveReferer(normalized.hostname);
+  if (referer) {
+    (init.headers as Record<string, string>)["Referer"] = referer;
+  }
 
   const rangeHeader = request.headers.get("Range");
   if (rangeHeader) {
@@ -191,7 +200,7 @@ export async function onRequest({ request, waitUntil, env }: { request: Request,
   const target = url.searchParams.get("target");
 
   if (target) {
-    return proxyKuwoAudio(target, request);
+    return proxyAudioTarget(target, request);
   }
 
   return proxyApiRequest(url, request, waitUntil, apiBaseUrl);
