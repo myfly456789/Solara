@@ -185,6 +185,134 @@ async function proxyApiRequest(url: URL, request: Request, waitUntil?: (promise:
   return response;
 }
 
+// ===== Meting 标准格式适配层 =====
+// 用于接入 api.qijieya.cn 等标准 Meting 实例：把 GD 格式请求翻译为 Meting 参数，
+// 再把 Meting 返回（含 302 重定向、纯文本歌词、扁平数组）转回前端期望的 GD 结构。
+const METING_TYPE_MAP: Record<string, string> = {
+  search: "search",
+  url: "url",
+  lyric: "lrc",
+  pic: "pic",
+  playlist: "playlist",
+};
+
+function extractMetingId(rawUrl: string): string {
+  try {
+    return new URL(rawUrl, "https://meting.local/").searchParams.get("id") || "";
+  } catch {
+    return "";
+  }
+}
+
+function jsonResponse(payload: unknown, status = 200): Response {
+  return new Response(JSON.stringify(payload), {
+    status,
+    headers: {
+      "Content-Type": "application/json; charset=utf-8",
+      "Access-Control-Allow-Origin": "*",
+      "Access-Control-Allow-Methods": "GET,HEAD,OPTIONS",
+      "Cache-Control": "no-store, no-cache, must-revalidate",
+    },
+  });
+}
+
+async function proxyMetingApi(url: URL, request: Request, apiBaseUrl: string): Promise<Response> {
+  const types = (url.searchParams.get("types") || "").toLowerCase();
+  const source = url.searchParams.get("source") || "netease";
+  const metingType = METING_TYPE_MAP[types];
+
+  if (!metingType) {
+    return jsonResponse({ error: "unsupported types" }, 400);
+  }
+
+  const apiUrl = new URL(apiBaseUrl);
+  apiUrl.searchParams.set("server", source);
+  apiUrl.searchParams.set("type", metingType);
+
+  if (types === "search") {
+    apiUrl.searchParams.set("id", url.searchParams.get("name") || "");
+    const limit = url.searchParams.get("count");
+    if (limit) apiUrl.searchParams.set("limit", limit);
+    const page = url.searchParams.get("pages");
+    if (page) apiUrl.searchParams.set("page", page);
+  } else {
+    apiUrl.searchParams.set("id", url.searchParams.get("id") || "");
+  }
+
+  // url / pic：Meting 返回 302，需手动读取 Location 转成 JSON 交给前端
+  if (types === "url" || types === "pic") {
+    const upstream = await fetch(apiUrl.toString(), {
+      method: request.method,
+      redirect: "manual",
+      headers: { "User-Agent": "Mozilla/5.0", "Accept": "*/*" },
+    });
+    const location = upstream.headers.get("Location") || "";
+    if (!location) {
+      return jsonResponse({ error: "no location" }, 502);
+    }
+    if (types === "pic") {
+      return jsonResponse({ url: location, from: "meting" });
+    }
+    return jsonResponse({
+      url: location,
+      br: Number(url.searchParams.get("br") || 320) || 320,
+      size: 0,
+      from: "meting",
+    });
+  }
+
+  const upstream = await fetch(apiUrl.toString(), {
+    method: request.method,
+    headers: { "User-Agent": "Mozilla/5.0", "Accept": "application/json, text/plain, */*" },
+  });
+  const text = await upstream.text();
+
+  if (types === "lyric") {
+    return jsonResponse({ lyric: text });
+  }
+
+  let data: any;
+  try {
+    data = JSON.parse(text);
+  } catch {
+    return jsonResponse({ error: "invalid upstream json" }, 502);
+  }
+
+  if (types === "search") {
+    const list = Array.isArray(data) ? data : [];
+    return jsonResponse(list.map((item: any) => ({
+      id: extractMetingId(item.url),
+      name: item.name || "",
+      artist: item.artist || "",
+      album: "",
+      pic_id: extractMetingId(item.pic),
+      url_id: extractMetingId(item.url),
+      lyric_id: extractMetingId(item.lrc),
+      source,
+    })));
+  }
+
+  if (types === "playlist") {
+    const list = Array.isArray(data) ? data : [];
+    const tracks = list.map((item: any) => {
+      const trackId = extractMetingId(item.url);
+      const picId = extractMetingId(item.pic);
+      return {
+        id: /^\d+$/.test(trackId) ? Number(trackId) : trackId,
+        name: item.name || "",
+        ar: [{ name: item.artist || "未知艺术家" }],
+        al: { name: "", picUrl: item.pic || "", pic: picId, pic_str: picId },
+        lyric_id: extractMetingId(item.lrc),
+        url_id: trackId,
+        source,
+      };
+    });
+    return jsonResponse({ playlist: { tracks } });
+  }
+
+  return jsonResponse(data);
+}
+
 export async function onRequest({ request, waitUntil, env }: { request: Request, waitUntil: (promise: Promise<any>) => void, env: any }): Promise<Response> {
   // 优先使用环境变量中配置的 API 地址，CF 部署未设置时 fallback 到默认节点
   const apiBaseUrl = (typeof env?.API_BASE_URL === "string" && env.API_BASE_URL) ? env.API_BASE_URL : DEFAULT_API_BASE_URL;
@@ -201,6 +329,12 @@ export async function onRequest({ request, waitUntil, env }: { request: Request,
 
   if (target) {
     return proxyAudioTarget(target, request);
+  }
+
+  // API_FORMAT=meting 时启用标准 Meting 适配层（配合 API_BASE_URL 指向 qijieya 等实例）
+  const apiFormat = (typeof env?.API_FORMAT === "string" && env.API_FORMAT) ? env.API_FORMAT.toLowerCase() : "";
+  if (apiFormat === "meting") {
+    return proxyMetingApi(url, request, apiBaseUrl);
   }
 
   return proxyApiRequest(url, request, waitUntil, apiBaseUrl);
